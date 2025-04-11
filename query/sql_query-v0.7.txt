@@ -1,0 +1,364 @@
+-- ============================
+-- 1. ВКЛЮЧЕНИЕ РАСШИРЕНИЯ
+-- ============================
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ============================
+-- 2. РОЛИ БАЗЫ ДАННЫХ
+-- ============================
+-- Создание ролей (без возможности логина, они будут использоваться для разграничения прав)
+CREATE ROLE manager NOLOGIN;
+CREATE ROLE db_admin NOLOGIN;
+CREATE ROLE technician NOLOGIN;
+CREATE ROLE quality_control NOLOGIN;
+CREATE ROLE diagnostics NOLOGIN;
+CREATE ROLE storage_operator NOLOGIN;
+CREATE ROLE intake_operator NOLOGIN;
+CREATE ROLE issue_operator NOLOGIN;
+
+
+CREATE TYPE role_enum AS ENUM (
+    'employee', 
+    'manager', 
+    'db_admin', 
+    'technician', 
+    'quality_control', 
+    'diagnostics', 
+    'storage_operator', 
+    'intake_operator', 
+    'issue_operator'
+);
+-- ============================
+-- 3. ТАБЛИЦЫ ПРЕДМЕТНОЙ ОБЛАСТИ
+-- ============================
+-- Клиенты
+CREATE TABLE Client (
+    client_id SERIAL PRIMARY KEY,
+    full_name VARCHAR(80) NOT NULL,
+    phone_number VARCHAR(20) NOT NULL,
+    email VARCHAR(80) NOT NULL
+);
+
+-- Склад
+CREATE TABLE Storage (
+    storage_id SERIAL PRIMARY KEY,
+    name VARCHAR(256) NOT NULL,
+    location VARCHAR(256) NOT NULL
+);
+
+-- Сотрудники
+CREATE TABLE Employee (
+    employee_id SERIAL PRIMARY KEY,
+    full_name VARCHAR(80) NOT NULL,
+    position VARCHAR(80) NOT NULL,
+    phone_number VARCHAR(20) NOT NULL,
+    contact_info VARCHAR(256) NOT NULL,
+    role role_enum NOT NULL DEFAULT 'employee',  -- Роль сотрудника (с ограничением на значения из списка)
+    login VARCHAR(80) UNIQUE NOT NULL,  -- Логин сотрудника
+    password_hash TEXT NOT NULL  -- Хеш пароля сотрудника
+);
+
+-- Поставщики
+CREATE TABLE Supplier (
+    supplier_id SERIAL PRIMARY KEY,
+    name VARCHAR(40) NOT NULL,
+    contact_phone VARCHAR(20) NOT NULL,
+    email VARCHAR(80) NOT NULL,
+    address TEXT NOT NULL
+);
+
+-- Оборудование
+CREATE TABLE Equipment (
+    equipment_id SERIAL PRIMARY KEY,
+    client_id INT NOT NULL REFERENCES Client(client_id) ON DELETE CASCADE,
+    storage_id INT NOT NULL REFERENCES Storage(storage_id) ON DELETE SET NULL,
+    serial_number VARCHAR(20) UNIQUE NOT NULL,
+    model VARCHAR(256) NOT NULL,
+    purchase_date DATE NOT NULL,
+    warranty_expiration DATE NOT NULL
+);
+
+-- Заявка на ремонт
+CREATE TABLE Repair_Request (
+    request_id SERIAL PRIMARY KEY,
+    equipment_id INT NOT NULL UNIQUE REFERENCES Equipment(equipment_id) ON DELETE CASCADE,
+    employee_id INT NOT NULL REFERENCES Employee(employee_id),
+    registration_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(20) NOT NULL
+);
+
+-- Ремонт
+CREATE TABLE Repair (
+    repair_id SERIAL PRIMARY KEY,
+    request_id INT NOT NULL REFERENCES Repair_Request(request_id),
+    employee_id INT NOT NULL REFERENCES Employee(employee_id),
+    start_date TIMESTAMP NOT NULL,
+    end_date TIMESTAMP,
+    work_description TEXT NOT NULL
+);
+
+-- Диагностика
+CREATE TABLE Diagnosis (
+    diagnosis_id SERIAL PRIMARY KEY,
+    request_id INT NOT NULL REFERENCES Repair_Request(request_id),
+    employee_id INT NOT NULL REFERENCES Employee(employee_id),
+    diagnosis_date TIMESTAMP NOT NULL,
+    diagnosis_results TEXT NOT NULL
+);
+
+-- Контроль качества
+CREATE TABLE Quality_Control (
+    check_id SERIAL PRIMARY KEY,
+    request_id INT NOT NULL REFERENCES Repair_Request(request_id),
+    employee_id INT NOT NULL REFERENCES Employee(employee_id),
+    check_date TIMESTAMP NOT NULL,
+    check_result TEXT NOT NULL,
+    comments TEXT
+);
+
+-- Компоненты
+CREATE TABLE Component (
+    component_id SERIAL PRIMARY KEY,
+    storage_id INT NOT NULL REFERENCES Storage(storage_id),
+    name VARCHAR(30) NOT NULL,
+    description TEXT NOT NULL
+);
+
+-- Заказ компонентов
+CREATE TABLE Component_Order (
+    order_id SERIAL PRIMARY KEY,
+    supplier_id INT NOT NULL REFERENCES Supplier(supplier_id),
+    employee_id INT NOT NULL REFERENCES Employee(employee_id),
+    order_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    order_status VARCHAR(20) NOT NULL,
+    total_cost DECIMAL(10,2) NOT NULL
+);
+
+-- Состав заказа
+CREATE TABLE Order_Detail (
+    order_id INT NOT NULL REFERENCES Component_Order(order_id),
+    component_id INT NOT NULL REFERENCES Component(component_id),
+    quantity INT NOT NULL,
+    PRIMARY KEY (order_id, component_id)
+);
+
+-- Отчет о выдаче оборудования
+CREATE TABLE Equipment_Report (
+    report_id SERIAL PRIMARY KEY,
+    equipment_id INT NOT NULL REFERENCES Equipment(equipment_id),
+    issue_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    recipient_name VARCHAR(80) NOT NULL
+);
+
+-- Функция-триггер для автоматического хеширования пароля при вставке/обновлении
+CREATE OR REPLACE FUNCTION hash_password() RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        -- Если значение не начинается с "$2", значит, пароль передан в чистом виде
+        IF NEW.password_hash !~ '^\\$2' THEN
+            NEW.password_hash := crypt(NEW.password_hash, gen_salt('bf'));
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- Если пароль изменился
+        IF NEW.password_hash <> OLD.password_hash THEN
+            -- Хэшировать, только если новый пароль не является уже хэшированным
+            IF NEW.password_hash !~ '^\\$2' THEN
+                NEW.password_hash := crypt(NEW.password_hash, gen_salt('bf'));
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_hash_password
+BEFORE INSERT OR UPDATE ON Employee
+FOR EACH ROW EXECUTE FUNCTION hash_password();
+
+
+-- ============================
+-- 4. ТАБЛИЦА АУДИТА (ЖУРНАЛ ИЗМЕНЕНИЙ)
+-- ============================
+CREATE TABLE Audit_Log (
+    audit_log_id SERIAL PRIMARY KEY, 
+    username TEXT NOT NULL,
+    user_role TEXT,
+    operation TEXT NOT NULL, -- INSERT / UPDATE / DELETE
+    table_name TEXT NOT NULL,
+    row_data JSONB,
+    operation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Функция для записи в журнал аудита
+CREATE OR REPLACE FUNCTION log_changes() RETURNS TRIGGER AS $$
+BEGIN
+    DECLARE
+        login TEXT := current_setting('app.current_login', true);
+        role TEXT := current_setting('app.current_role', true);
+    BEGIN
+        IF (TG_OP = 'DELETE') THEN
+            INSERT INTO Audit_Log (username, user_role, operation, table_name, row_data)
+            VALUES (login, role, TG_OP, TG_TABLE_NAME, row_to_json(OLD));
+            RETURN OLD;
+        ELSIF (TG_OP = 'INSERT') THEN
+            INSERT INTO Audit_Log (username, user_role, operation, table_name, row_data)
+            VALUES (login, role, TG_OP, TG_TABLE_NAME, row_to_json(NEW));
+            RETURN NEW;
+        ELSIF (TG_OP = 'UPDATE') THEN
+            INSERT INTO Audit_Log (username, user_role, operation, table_name, row_data)
+            VALUES (login, role, TG_OP, TG_TABLE_NAME, row_to_json(NEW));
+            RETURN NEW;
+        END IF;
+        RETURN NULL;
+    END;
+END;
+
+$$ LANGUAGE plpgsql;
+
+-- ЛОГИРОВАНИЕ
+
+-- Логирование изменений для таблицы Client
+CREATE TRIGGER trg_log_client
+AFTER INSERT OR UPDATE OR DELETE ON Client
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Storage
+CREATE TRIGGER trg_log_storage
+AFTER INSERT OR UPDATE OR DELETE ON Storage
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Employee
+CREATE TRIGGER trg_log_employee
+AFTER INSERT OR UPDATE OR DELETE ON Employee
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Supplier
+CREATE TRIGGER trg_log_supplier
+AFTER INSERT OR UPDATE OR DELETE ON Supplier
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Equipment
+CREATE TRIGGER trg_log_equipment
+AFTER INSERT OR UPDATE OR DELETE ON Equipment
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Repair_Request
+CREATE TRIGGER trg_log_repair_request
+AFTER INSERT OR UPDATE OR DELETE ON Repair_Request
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Repair
+CREATE TRIGGER trg_log_repair
+AFTER INSERT OR UPDATE OR DELETE ON Repair
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Diagnosis
+CREATE TRIGGER trg_log_diagnosis
+AFTER INSERT OR UPDATE OR DELETE ON Diagnosis
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Quality_Control
+CREATE TRIGGER trg_log_quality_control
+AFTER INSERT OR UPDATE OR DELETE ON Quality_Control
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Component
+CREATE TRIGGER trg_log_component
+AFTER INSERT OR UPDATE OR DELETE ON Component
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Component_Order
+CREATE TRIGGER trg_log_component_order
+AFTER INSERT OR UPDATE OR DELETE ON Component_Order
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Order_Detail
+CREATE TRIGGER trg_log_order_detail
+AFTER INSERT OR UPDATE OR DELETE ON Order_Detail
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+-- Логирование изменений для таблицы Equipment_Report
+CREATE TRIGGER trg_log_equipment_report
+AFTER INSERT OR UPDATE OR DELETE ON Equipment_Report
+FOR EACH ROW EXECUTE FUNCTION log_changes();
+
+
+
+-- ============================
+-- 5. РАЗГРАНИЧЕНИЕ ДОСТУПА (GRANT/REVOKE)
+-- ============================
+
+-- Сброс прав доступа перед назначением
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM manager;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM db_admin;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM technician;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM quality_control;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM diagnostics;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM storage_operator;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM intake_operator;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM issue_operator;
+
+-- --- Схема доступа для роли "Руководитель" (manager) ---
+GRANT ALL ON Client TO manager;
+GRANT ALL ON Storage TO manager;
+GRANT ALL ON Employee TO manager;
+GRANT ALL ON Supplier TO manager;
+GRANT ALL ON Equipment TO manager;
+GRANT ALL ON Repair_Request TO manager;
+GRANT ALL ON Repair TO manager;
+GRANT ALL ON Diagnosis TO manager;
+GRANT ALL ON Quality_Control TO manager;
+GRANT ALL ON Component TO manager;
+GRANT ALL ON Component_Order TO manager;
+GRANT ALL ON Order_Detail TO manager;
+GRANT ALL ON Equipment_Report TO manager;
+GRANT ALL ON Audit_Log TO manager;
+
+-- --- Схема доступа для роли "Администратор БД" (db_admin) ---
+GRANT ALL ON Audit_Log TO db_admin;
+GRANT SELECT ON Client TO db_admin;
+GRANT SELECT ON Storage TO db_admin;
+GRANT SELECT ON Employee TO db_admin;
+GRANT SELECT ON Supplier TO db_admin;
+GRANT SELECT ON Equipment TO db_admin;
+GRANT SELECT ON Repair_Request TO db_admin;
+GRANT SELECT ON Repair TO db_admin;
+GRANT SELECT ON Diagnosis TO db_admin;
+GRANT SELECT ON Quality_Control TO db_admin;
+GRANT SELECT ON Component TO db_admin;
+GRANT SELECT ON Component_Order TO db_admin;
+GRANT SELECT ON Order_Detail TO db_admin;
+GRANT SELECT ON Equipment_Report TO db_admin;
+
+-- --- Схема доступа для роли "Мастер по ремонту" (technician) ---
+GRANT SELECT ON Equipment TO technician;
+GRANT SELECT ON Repair_Request TO technician;
+GRANT INSERT, SELECT, UPDATE ON Repair TO technician;
+GRANT SELECT ON Diagnosis TO technician;
+GRANT SELECT ON Quality_Control TO technician;
+
+-- --- Схема доступа для роли "Контролер качества" (quality_control) ---
+GRANT SELECT ON Equipment TO quality_control;
+GRANT SELECT ON Repair TO quality_control;
+GRANT INSERT, SELECT, UPDATE ON Quality_Control TO quality_control;
+
+-- --- Схема доступа для роли "Диагност" (diagnostics) ---
+GRANT SELECT ON Equipment TO diagnostics;
+GRANT SELECT ON Repair_Request TO diagnostics;
+GRANT INSERT, SELECT, UPDATE ON Diagnosis TO diagnostics;
+
+-- --- Схема доступа для роли "Складской учет" (storage_operator) ---
+GRANT INSERT, SELECT, UPDATE ON Storage TO storage_operator;
+GRANT INSERT, SELECT, UPDATE ON Component TO storage_operator;
+GRANT INSERT, SELECT, UPDATE ON Component_Order TO storage_operator;
+GRANT INSERT, SELECT, UPDATE ON Order_Detail TO storage_operator;
+
+-- --- Схема доступа для роли "Приемщик оборудования" (intake_operator) ---
+GRANT INSERT, SELECT, UPDATE ON Client TO intake_operator;
+GRANT INSERT, SELECT, UPDATE ON Equipment TO intake_operator;
+GRANT INSERT, SELECT, UPDATE ON Repair_Request TO intake_operator;
+
+-- --- Схема доступа для роли "Персонал выдачи" (issue_operator) ---
+GRANT SELECT ON Client TO issue_operator;
+GRANT SELECT ON Equipment TO issue_operator;
+GRANT INSERT, SELECT, UPDATE ON Equipment_Report TO issue_operator;

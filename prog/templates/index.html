@@ -1,0 +1,26 @@
+{% extends 'base.html' %}
+{% block title %}Главная{% endblock %}
+{% block content %}
+<div class="text-center mb-5">
+  <h1 class="mb-3">Добро пожаловать в систему</h1>
+  <p class="lead">Вы вошли как <strong>{{ role }}</strong></p>
+</div>
+
+{% if tables %}
+  <h4>Доступные таблицы:</h4>
+  <div class="row">
+    {% for table in tables %}
+      <div class="col-md-4 mb-4">
+        <div class="card shadow-sm h-100">
+          <div class="card-body text-center">
+            <h5 class="card-title text-capitalize">{{ table.replace('_', ' ') }}</h5>
+            <a href="{{ url_for('dashboard.view_table', table_name=table) }}" class="btn btn-primary mt-3">Открыть</a>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="alert alert-warning text-center">Нет доступных таблиц для просмотра</div>
+{% endif %}
+{% endblock %}

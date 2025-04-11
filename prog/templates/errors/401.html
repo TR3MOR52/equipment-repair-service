@@ -1,0 +1,9 @@
+{% extends 'base.html' %}
+{% block title %}401 - Не авторизован{% endblock %}
+{% block content %}
+<div class="text-center">
+  <h1 class="display-3 text-secondary">401</h1>
+  <p class="lead">Пожалуйста, войдите в систему, чтобы получить доступ.</p>
+  <a href="{{ url_for('auth.login') }}" class="btn btn-primary">Войти</a>
+</div>
+{% endblock %}
